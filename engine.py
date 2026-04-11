@@ -1,245 +1,267 @@
 """
-engine.py — Risk-Aware Logistics Optimizer
-LogisticsGraph: Dijkstra · Greedy · Multi-Stage DP
+engine.py
+Indian Logistics Optimizer — Core Engine
 """
 
 import heapq
 import math
-from typing import Optional
+from dataclasses import dataclass, field
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data types
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Edge:
+    source:      str
+    destination: str
+    distance:    float      # kilometres
+    risk:        float      # 0.0 – 1.0  (higher = more dangerous)
+    weather_ok:  bool = True
+
+
+@dataclass
+class RouteResult:
+    path:           list[str]
+    total_cost:     float
+    edges_used:     list[Edge] = field(default_factory=list)
+    filtered_count: int = 0
+    blocked:        bool = False   # True when constraints make route impossible
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LogisticsGraph
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LogisticsGraph:
     """
-    Weighted directed graph where every edge carries both a
-    *distance* cost and a *risk* score (0–1 scale).
+    Directed weighted graph.
 
-    Internal adjacency structure
-    ----------------------------
-    self.graph[u] = [(v, dist, risk), ...]
+    Storage : Edge List  (self.edge_list)
+    Nodes   : ordered list (self.nodes)
     """
 
     def __init__(self):
-        self.graph: dict[str, list[tuple[str, float, float]]] = {}
+        self.edge_list: list[Edge] = []
+        self.nodes:     list[str]  = []
 
-    # ------------------------------------------------------------------
-    # Graph construction helpers
-    # ------------------------------------------------------------------
+    # ── Construction ─────────────────────────────────────────────────────────
 
-    def add_node(self, node: str) -> None:
-        if node not in self.graph:
-            self.graph[node] = []
+    def add_node(self, name: str) -> None:
+        if name not in self.nodes:
+            self.nodes.append(name)
 
     def add_edge(
         self,
-        u: str,
-        v: str,
-        dist: float,
-        risk: float,
+        source: str, destination: str,
+        distance: float, risk: float,
+        weather_ok: bool = True,
         bidirectional: bool = True,
     ) -> None:
-        """Add a directed (or bidirectional) edge with distance and risk."""
-        self.add_node(u)
-        self.add_node(v)
-        self.graph[u].append((v, dist, risk))
+        self.add_node(source)
+        self.add_node(destination)
+        self.edge_list.append(Edge(source, destination, distance, risk, weather_ok))
         if bidirectional:
-            self.graph[v].append((u, dist, risk))
+            self.edge_list.append(Edge(destination, source, distance, risk, weather_ok))
 
-    # ------------------------------------------------------------------
-    # Shared cost formula
-    # ------------------------------------------------------------------
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _edge_cost(dist: float, risk: float, risk_weight: float) -> float:
-        """Blended cost = dist*(1-w) + risk*w*100."""
-        return dist * (1 - risk_weight) + risk * risk_weight * 100
+    def _blended_cost(edge: Edge, risk_weight: float) -> float:
+        return edge.distance * (1 - risk_weight) + edge.risk * risk_weight * 100
 
-    # ------------------------------------------------------------------
-    # 1. Dijkstra  (exact shortest path)
-    # ------------------------------------------------------------------
+    def _filter_edges(
+        self, risk_threshold: float, require_weather: bool
+    ) -> tuple[list[Edge], int]:
+        """Return (surviving_edges, removed_count) after applying constraints."""
+        surviving, removed = [], 0
+        for e in self.edge_list:
+            if e.risk > risk_threshold:
+                removed += 1
+                continue
+            if require_weather and not e.weather_ok:
+                removed += 1
+                continue
+            surviving.append(e)
+        return surviving, removed
 
-    def get_dijkstra(
-        self, start: str, end: str, risk_weight: float = 0.5
-    ) -> tuple[Optional[list[str]], float]:
-        """
-        Standard Dijkstra using the blended cost as edge weight.
+    def _build_adj(
+        self, edges: list[Edge]
+    ) -> dict[str, list[tuple[str, Edge]]]:
+        adj: dict[str, list[tuple[str, Edge]]] = {n: [] for n in self.nodes}
+        for e in edges:
+            adj.setdefault(e.source, []).append((e.destination, e))
+        return adj
 
-        Returns
-        -------
-        (path, total_cost)  — path is None when no route exists.
-        """
-        if start not in self.graph or end not in self.graph:
-            return None, math.inf
+    # ── 1. Hybrid: Risk Filter  +  Dijkstra ──────────────────────────────────
+    #    Phase 1 — strip edges that violate risk / weather constraints
+    #    Phase 2 — Dijkstra on surviving edge set
+    #
+    #    Internal data structures:
+    #      Edge List  → source of truth
+    #      Array      → dist_array  (indexed by node position)
+    #      Priority Queue → min-heap open set
 
-        dist_map: dict[str, float] = {n: math.inf for n in self.graph}
-        dist_map[start] = 0.0
-        prev: dict[str, Optional[str]] = {n: None for n in self.graph}
+    def get_optimized_route(
+        self,
+        start: str, end: str,
+        risk_weight: float = 0.3,
+        risk_threshold: float = 0.4,
+        require_weather: bool = True,
+    ) -> RouteResult:
 
-        heap: list[tuple[float, str]] = [(0.0, start)]
+        INF = math.inf
+        surviving, removed_count = self._filter_edges(risk_threshold, require_weather)
+        adj = self._build_adj(surviving)
 
-        while heap:
-            cur_cost, u = heapq.heappop(heap)
-            if cur_cost > dist_map[u]:
+        node_index = {n: i for i, n in enumerate(self.nodes)}
+        src_idx = node_index.get(start)
+        dst_idx = node_index.get(end)
+        if src_idx is None or dst_idx is None:
+            return RouteResult([], INF, filtered_count=removed_count, blocked=True)
+
+        # Array — distance table
+        dist_array: list[float]      = [INF]  * len(self.nodes)
+        prev_node:  list[str | None] = [None] * len(self.nodes)
+        dist_array[src_idx] = 0.0
+
+        # Priority Queue
+        pq: list[tuple[float, str]] = []
+        heapq.heappush(pq, (0.0, start))
+
+        edge_map: dict[tuple[str, str], Edge] = {}
+
+        while pq:
+            cur_cost, u = heapq.heappop(pq)
+            u_idx = node_index[u]
+            if cur_cost > dist_array[u_idx]:
                 continue
             if u == end:
                 break
-            for v, d, r in self.graph[u]:
-                new_cost = cur_cost + self._edge_cost(d, r, risk_weight)
-                if new_cost < dist_map[v]:
-                    dist_map[v] = new_cost
-                    prev[v] = u
-                    heapq.heappush(heap, (new_cost, v))
+            for v, edge in adj.get(u, []):
+                v_idx    = node_index[v]
+                new_cost = dist_array[u_idx] + self._blended_cost(edge, risk_weight)
+                if new_cost < dist_array[v_idx]:
+                    dist_array[v_idx] = new_cost
+                    prev_node[v_idx]  = u
+                    edge_map[(u, v)]  = edge
+                    heapq.heappush(pq, (new_cost, v))
 
-        if dist_map[end] == math.inf:
-            return None, math.inf
+        if dist_array[dst_idx] == INF:
+            return RouteResult([], INF, filtered_count=removed_count, blocked=True)
 
         # Reconstruct path
-        path, node = [], end
-        while node is not None:
-            path.append(node)
-            node = prev[node]
+        path, cursor = [], end
+        while cursor is not None:
+            path.append(cursor)
+            cursor = prev_node[node_index[cursor]]
         path.reverse()
-        return path, round(dist_map[end], 4)
 
-    # ------------------------------------------------------------------
-    # 2. Greedy  (myopic best neighbour)
-    # ------------------------------------------------------------------
+        edges_used = [
+            edge_map[(path[i], path[i + 1])]
+            for i in range(len(path) - 1)
+            if (path[i], path[i + 1]) in edge_map
+        ]
 
-    def get_greedy(
-        self, start: str, end: str, risk_weight: float = 0.5
-    ) -> tuple[Optional[list[str]], float]:
-        """
-        Greedy nearest-neighbour traversal.
+        return RouteResult(
+            path           = path,
+            total_cost     = round(dist_array[dst_idx], 4),
+            edges_used     = edges_used,
+            filtered_count = removed_count,
+            blocked        = False,
+        )
 
-        At every step the neighbour with the lowest *immediate* blended
-        cost  ``dist*(1-w) + risk*w*100``  is chosen, regardless of the
-        accumulated path cost.  Visited nodes are not revisited so the
-        algorithm always terminates, but it may fail to find a path even
-        when one exists, and the path found is rarely optimal.
+    # ── 2. Multi-Stage Dynamic Programming ───────────────────────────────────
+    #    Recurrence: cost(i,j) = min { cost(i-1,k) + c(k,j) }
+    #
+    #    Internal data structures:
+    #      Edge List  → cost lookup after constraint filtering
+    #      Matrix     → dp_matrix[stage][node_idx]
+    #      Stack      → LIFO path reconstruction
 
-        Returns
-        -------
-        (path, total_cost)
-        """
-        if start not in self.graph or end not in self.graph:
-            return None, math.inf
-
-        path = [start]
-        visited = {start}
-        total_cost = 0.0
-        current = start
-
-        while current != end:
-            neighbours = [
-                (v, d, r)
-                for v, d, r in self.graph.get(current, [])
-                if v not in visited
-            ]
-            if not neighbours:
-                return None, math.inf  # Dead end — greedy failed
-
-            # Pick neighbour with minimum immediate blended cost
-            best_v, best_d, best_r = min(
-                neighbours,
-                key=lambda t: self._edge_cost(t[1], t[2], risk_weight),
-            )
-            total_cost += self._edge_cost(best_d, best_r, risk_weight)
-            path.append(best_v)
-            visited.add(best_v)
-            current = best_v
-
-        return path, round(total_cost, 4)
-
-    # ------------------------------------------------------------------
-    # 3. Multi-Stage DP  (bottom-up, Factory→Port→Hub→Customer)
-    # ------------------------------------------------------------------
-
-    def get_dp(
+    def get_dp_route(
         self,
         stages: list[list[str]],
-        risk_weight: float = 0.5,
-    ) -> tuple[Optional[list[str]], float]:
-        """
-        Bottom-up Dynamic Programming for a multi-stage logistics graph.
+        risk_weight: float = 0.3,
+        risk_threshold: float = 1.0,      # ← now honoured
+        require_weather: bool = False,    # ← now honoured
+    ) -> RouteResult:
 
-        Parameters
-        ----------
-        stages : list of lists
-            Each inner list is a stage (layer).  Example::
+        INF = math.inf
 
-                stages = [
-                    ["Factory"],            # stage 0
-                    ["Port_A", "Port_B"],   # stage 1
-                    ["Hub_X", "Hub_Y"],     # stage 2
-                    ["Customer"],           # stage 3
-                ]
+        if not stages or not any(stages):
+            return RouteResult([], INF, blocked=True)
 
-        risk_weight : float
-            Blending weight for risk vs distance.
+        # Filter Edge List by the same constraints as Dijkstra
+        surviving, removed_count = self._filter_edges(risk_threshold, require_weather)
 
-        Returns
-        -------
-        (path, total_cost)
+        # Build cost lookup from surviving edges only
+        edge_cost_map: dict[tuple[str, str], float] = {}
+        for e in surviving:
+            key  = (e.source, e.destination)
+            cost = self._blended_cost(e, risk_weight)
+            if key not in edge_cost_map or cost < edge_cost_map[key]:
+                edge_cost_map[key] = cost
 
-        Algorithm
-        ---------
-        For each node in the *last* stage, dp[node] = 0.
-        Working backwards through stages, for each node u in stage s
-        and each edge (u→v) where v is in stage s+1::
+        num_stages = len(stages)
+        max_width  = max(len(s) for s in stages)
 
-            dp[u] = min over v of (edge_cost(u,v) + dp[v])
+        # Matrix initialisation
+        dp_matrix  = [[INF] * max_width for _ in range(num_stages)]   # Matrix
+        choice_mat = [[-1]  * max_width for _ in range(num_stages)]   # Matrix
 
-        The optimal path is then reconstructed greedily forwards from
-        stages[0][0].
-        """
-        if not stages or not stages[0]:
-            return None, math.inf
+        # Base case
+        for j in range(len(stages[0])):
+            dp_matrix[0][j] = 0.0
 
-        # Build a fast lookup: node → stage index
-        node_to_stage: dict[str, int] = {}
-        for s_idx, stage in enumerate(stages):
-            for node in stage:
-                node_to_stage[node] = s_idx
-
-        # Validate all stage nodes exist in the graph
-        all_stage_nodes = {n for stage in stages for n in stage}
-        for n in all_stage_nodes:
-            if n not in self.graph:
-                self.add_node(n)
-
-        # DP tables
-        dp: dict[str, float] = {}
-        next_node: dict[str, Optional[str]] = {}
-
-        # Base case: last stage costs 0
-        for node in stages[-1]:
-            dp[node] = 0.0
-            next_node[node] = None
-
-        # Fill backwards through stages
-        for s_idx in range(len(stages) - 2, -1, -1):
-            next_stage_set = set(stages[s_idx + 1])
-            for u in stages[s_idx]:
-                best_cost = math.inf
-                best_v = None
-                for v, d, r in self.graph.get(u, []):
-                    if v not in next_stage_set:
+        # Forward fill — recurrence: cost(i,j) = min{cost(i-1,k) + c(k,j)}
+        for i in range(1, num_stages):
+            for j_idx, j_node in enumerate(stages[i]):
+                for k_idx, k_node in enumerate(stages[i - 1]):
+                    prev = dp_matrix[i - 1][k_idx]
+                    if prev == INF:
                         continue
-                    candidate = self._edge_cost(d, r, risk_weight) + dp.get(v, math.inf)
-                    if candidate < best_cost:
-                        best_cost = candidate
-                        best_v = v
-                dp[u] = best_cost
-                next_node[u] = best_v
+                    c_kj = edge_cost_map.get((k_node, j_node), INF)
+                    if c_kj == INF:
+                        continue
+                    candidate = prev + c_kj
+                    if candidate < dp_matrix[i][j_idx]:
+                        dp_matrix[i][j_idx]  = candidate
+                        choice_mat[i][j_idx] = k_idx
 
-        # Reconstruct path from stage 0
-        start = stages[0][0]
-        if dp.get(start, math.inf) == math.inf:
-            return None, math.inf
+        # Best endpoint in final stage
+        last_costs   = [dp_matrix[num_stages - 1][j] for j in range(len(stages[-1]))]
+        best_end_idx = last_costs.index(min(last_costs))
+        best_cost    = last_costs[best_end_idx]
 
-        path = [start]
-        cur = start
-        while next_node.get(cur) is not None:
-            cur = next_node[cur]
-            path.append(cur)
+        if best_cost == INF:
+            return RouteResult([], INF, filtered_count=removed_count, blocked=True)
 
-        return path, round(dp[start], 4)
+        # Stack-based path reconstruction (LIFO)
+        stack: list[str] = []
+        j_idx = best_end_idx
+        for i in range(num_stages - 1, -1, -1):
+            stack.append(stages[i][j_idx])          # push
+            if i > 0:
+                j_idx = choice_mat[i][j_idx]
+
+        path: list[str] = []
+        while stack:
+            path.append(stack.pop())                # pop → forward order
+
+        # Enrich edges_used from original edge list
+        edges_used = []
+        for i in range(len(path) - 1):
+            for e in self.edge_list:
+                if e.source == path[i] and e.destination == path[i + 1]:
+                    edges_used.append(e)
+                    break
+
+        return RouteResult(
+            path           = path,
+            total_cost     = round(best_cost, 4),
+            edges_used     = edges_used,
+            filtered_count = removed_count,
+            blocked        = False,
+        )
